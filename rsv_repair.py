@@ -41,6 +41,7 @@ class RSVRepairApp:
 
         self._build_ui()
         self._setup_drag_and_drop()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
         bg = "#1e1e1e"
@@ -309,6 +310,15 @@ class RSVRepairApp:
             folder = os.path.dirname(self.output_path)
             os.startfile(folder)
 
+    def _on_close(self):
+        """Handle window close event to ensure clean exit with zero background processes."""
+        self.repairing = False
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -317,7 +327,10 @@ class RSVRepairApp:
 def main():
     root = tk.Tk()
     app = RSVRepairApp(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        os._exit(0)
 
 
 if __name__ == "__main__":
