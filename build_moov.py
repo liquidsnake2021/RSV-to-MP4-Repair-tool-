@@ -379,7 +379,7 @@ def parse_rsv(rsv_path, log_fn=None):
         
         # Parse first video chunk to find its end, then detect audio size
         video_start_0 = meta_chunk_size
-        frame_sizes_0 = parse_video_chunk_avcc(f, video_start_0, video_start_0 + 12_000_000)
+        frame_sizes_0 = parse_video_chunk_avcc(f, video_start_0, video_start_0 + 25_000_000)
         video_end_0 = video_start_0 + sum(frame_sizes_0)
         
         # Find second meta chunk to determine audio size
@@ -433,10 +433,8 @@ def parse_rsv(rsv_path, log_fn=None):
             
             # Find the NEXT meta chunk first so we know exact boundaries
             next_meta = None
-            # Estimate: video is ~8-10MB, then audio
-            est_cycle = meta_chunk_size + 9_000_000 + audio_chunk_size
-            search_start = meta_start + meta_chunk_size + 7_000_000  # min video
-            search_end = min(meta_start + meta_chunk_size + 12_000_000 + audio_chunk_size, rsv_size)
+            search_start = meta_start + meta_chunk_size + 200_000  # allow smaller video chunks (HEVC / 1080p)
+            search_end = min(meta_start + meta_chunk_size + 30_000_000, rsv_size)
             
             # Read the search region and scan for META_SIG
             f.seek(search_start)
@@ -453,7 +451,7 @@ def parse_rsv(rsv_path, log_fn=None):
                 max_video_end = next_meta - audio_chunk_size
             else:
                 # Last chunk — use generous bound
-                max_video_end = min(video_start + 12_000_000, rsv_size)
+                max_video_end = min(video_start + 25_000_000, rsv_size)
             
             frame_sizes = parse_video_chunk_avcc(f, video_start, max_video_end)
             
