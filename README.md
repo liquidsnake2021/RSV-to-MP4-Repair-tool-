@@ -38,6 +38,7 @@ Your original `.RSV` file is **never modified**. The repaired file is saved as `
 ## Supported Formats
 
 - Sony XAVC-S recordings (H.264 High 4:2:2 / High 4:2:0)
+- Sony XAVC-HS recordings (HEVC / H.265 Main 10)
 - 4K (3840×2160) and 1080p resolutions
 - PCM audio (48kHz, 16-bit stereo)
 - Files of any size (tested up to 51 GB)

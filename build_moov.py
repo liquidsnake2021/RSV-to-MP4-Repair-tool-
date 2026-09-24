@@ -244,19 +244,19 @@ META_SAMPLE_SIZE = 11264
 META_SAMPLES_PER_CHUNK = 15
 META_CHUNK_SIZE = META_SAMPLE_SIZE * META_SAMPLES_PER_CHUNK  # 168960
 AUDIO_CHUNK_SIZE = 24024 * 4  # 96096
-META_SIG = b'\x00\x1c\x01\x00\x08'
+META_SIG = b'\x00\x1c\x01\x00'  # 4-byte RTMD signature (5th byte: 0x08=H.264, 0x09=HEVC)
 
 
 def verify_meta_sig(f, offset, rsv_size):
     """Check if offset has the meta signature and the next sample also has it."""
-    if offset + META_SAMPLE_SIZE + 5 > rsv_size:
+    if offset + META_SAMPLE_SIZE + len(META_SIG) > rsv_size:
         return False
     f.seek(offset)
-    sig = f.read(5)
+    sig = f.read(len(META_SIG))
     if sig != META_SIG:
         return False
     f.seek(offset + META_SAMPLE_SIZE)
-    sig2 = f.read(5)
+    sig2 = f.read(len(META_SIG))
     return sig2 == META_SIG
 
 
@@ -264,9 +264,9 @@ def detect_samples_per_chunk(f, rsv_size):
     """Auto-detect how many metadata samples are in each chunk."""
     count = 0
     pos = 0
-    while pos + 5 < rsv_size:
+    while pos + len(META_SIG) < rsv_size:
         f.seek(pos)
-        sig = f.read(5)
+        sig = f.read(len(META_SIG))
         if sig != META_SIG:
             break
         count += 1
@@ -282,20 +282,42 @@ def detect_audio_chunk_size(f, video_end, next_meta_start):
 def parse_video_chunk_avcc(f, video_start, max_end):
     """Parse AVCC NAL units to find frame boundaries within a video chunk.
     
-    Uses per-seek reads (fast enough for ~9MB chunks). AUD NAL (type 9)
-    as frame delimiter. Returns list of frame sizes.
+    Handles both H.264 and HEVC NAL formats. Uses AUD NAL as frame delimiter.
+    H.264 AUD = NAL type 9, HEVC AUD = NAL type 35.
+    Returns list of frame sizes.
     """
     pos = video_start
     frame_start = pos
     frame_sizes = []
     
+    # Detect codec from first NAL: read 6 bytes (4 len + 2 NAL header)
+    f.seek(pos)
+    first = f.read(6)
+    if len(first) < 6:
+        return frame_sizes
+    first_nal_byte = first[4]
+    # HEVC NAL header: forbidden(1) | type(6) | layer_id(6) | tid(3) = 16 bits
+    # H.264 NAL header: forbidden(1) | ref_idc(2) | type(5) = 8 bits
+    # HEVC AUD byte = (35 << 1) = 0x46, H.264 AUD byte = 0x09 (ref_idc=0, type=9)
+    is_hevc = (first_nal_byte & 0x81) == 0 and ((first_nal_byte >> 1) & 0x3f) in (32, 33, 34, 35, 39, 19, 20, 0, 1)
+    
+    # For HEVC: also check if it looks like AUD (0x46 0x01)
+    if not is_hevc and first_nal_byte == 0x46:
+        is_hevc = True
+    
+    aud_type = 35 if is_hevc else 9
+    
     while pos < max_end:
         f.seek(pos)
-        lb = f.read(5)
+        lb = f.read(6)
         if len(lb) < 5:
             break
         nl = struct.unpack('>I', lb[:4])[0]
-        nt = lb[4] & 0x1f
+        
+        if is_hevc:
+            nt = (lb[4] >> 1) & 0x3f
+        else:
+            nt = lb[4] & 0x1f
         
         # Stop on zero length or unreasonable length
         if nl == 0 or nl > 10_000_000:
@@ -305,12 +327,16 @@ def parse_video_chunk_avcc(f, video_start, max_end):
         if pos + 4 + nl > max_end:
             break
         
-        # Validate NAL type
-        if nt > 12 and nt not in (24, 25, 26, 27, 28):
-            break
+        # Validate NAL type range
+        if is_hevc:
+            if nt > 48:
+                break
+        else:
+            if nt > 12 and nt not in (24, 25, 26, 27, 28):
+                break
         
-        # AUD (type 9) marks frame boundary
-        if nt == 9 and pos > frame_start:
+        # AUD marks frame boundary
+        if nt == aud_type and pos > frame_start:
             frame_sizes.append(pos - frame_start)
             frame_start = pos
         
@@ -361,10 +387,10 @@ def parse_rsv(rsv_path, log_fn=None):
         audio_chunk_size = None
         for search_pos in range(video_end_0, min(video_end_0 + 500_000, rsv_size), 1):
             f.seek(search_pos)
-            sig = f.read(5)
+            sig = f.read(len(META_SIG))
             if sig == META_SIG:
                 f.seek(search_pos + META_SAMPLE_SIZE)
-                sig2 = f.read(5)
+                sig2 = f.read(len(META_SIG))
                 if sig2 == META_SIG:
                     audio_chunk_size = search_pos - video_end_0
                     log_fn(f"Detected audio_chunk_size = {audio_chunk_size:,} bytes "
@@ -415,8 +441,8 @@ def parse_rsv(rsv_path, log_fn=None):
             # Read the search region and scan for META_SIG
             f.seek(search_start)
             search_buf = f.read(search_end - search_start)
-            for i in range(len(search_buf) - 5):
-                if search_buf[i:i+5] == META_SIG:
+            for i in range(len(search_buf) - len(META_SIG)):
+                if search_buf[i:i+len(META_SIG)] == META_SIG:
                     candidate = search_start + i
                     if verify_meta_sig(f, candidate, rsv_size):
                         next_meta = candidate
@@ -844,6 +870,52 @@ def build_mp4(donor_path, rsv_path, output_path, log_fn=None):
 # Standalone mode helpers
 # ---------------------------------------------------------------------------
 
+class BitReader:
+    def __init__(self, data):
+        # Remove emulation prevention bytes
+        clean_data = bytearray()
+        i = 0
+        while i < len(data):
+            if i + 2 < len(data) and data[i] == 0 and data[i+1] == 0 and data[i+2] == 3:
+                clean_data.extend(data[i:i+2])
+                i += 3
+            else:
+                clean_data.append(data[i])
+                i += 1
+        self.data = clean_data
+        self.byte_idx = 0
+        self.bit_idx = 0
+        
+    def read_bit(self):
+        if self.byte_idx >= len(self.data): return 0
+        val = (self.data[self.byte_idx] >> (7 - self.bit_idx)) & 1
+        self.bit_idx += 1
+        if self.bit_idx == 8:
+            self.byte_idx += 1
+            self.bit_idx = 0
+        return val
+
+    def read_bits(self, n):
+        val = 0
+        for _ in range(n):
+            val = (val << 1) | self.read_bit()
+        return val
+
+    def read_ue(self):
+        zeros = 0
+        while self.read_bit() == 0 and self.byte_idx < len(self.data):
+            zeros += 1
+        if self.byte_idx >= len(self.data): return 0
+        return (1 << zeros) - 1 + self.read_bits(zeros)
+        
+    def read_se(self):
+        v = self.read_ue()
+        if v % 2 == 0:
+            return -(v // 2)
+        else:
+            return (v + 1) // 2
+
+
 def construct_sps_pps(f, video_start, meta_start):
     """Extract real H.264 SPS and PPS from the Sony kkad box in RTMD metadata.
     
@@ -858,19 +930,13 @@ def construct_sps_pps(f, video_start, meta_start):
     f.seek(meta_start)
     meta_sample = f.read(META_SAMPLE_SIZE)
     
-    # Find kkad box: scan for 'kkad' box type
+    # Find kkad box by searching for 'kkad' tag
     kkad_data = None
-    pos = 0
-    while pos < len(meta_sample) - 8:
-        box_size = struct.unpack('>I', meta_sample[pos:pos+4])[0]
-        box_type = meta_sample[pos+4:pos+8]
-        if box_size < 8 or pos + box_size > len(meta_sample):
-            pos += 4
-            continue
-        if box_type == b'kkad':
-            kkad_data = meta_sample[pos+8:pos+box_size]
-            break
-        pos += box_size
+    idx = meta_sample.find(b'kkad')
+    if idx >= 4:
+        box_size = struct.unpack('>I', meta_sample[idx-4:idx])[0]
+        if 8 < box_size < 2000 and idx - 4 + box_size <= len(meta_sample):
+            kkad_data = meta_sample[idx+4:idx-4+box_size]
     
     if kkad_data is None:
         raise ValueError("Could not find kkad box in RTMD metadata")
@@ -898,7 +964,7 @@ def construct_sps_pps(f, video_start, meta_start):
         if entry_len < 6 or entry_len > 500:
             continue
         
-        data_len = entry_len - 2  # subtract 2-byte tag
+        data_len = entry_len - 4  # subtract 2-byte len field + 2-byte tag
         nal_start = i + 2
         nal_end = nal_start + data_len
         
@@ -947,6 +1013,238 @@ def construct_sps_pps(f, video_start, meta_start):
     codec_info['pps_list'] = pps_list
     
     return sps, pps_list, codec_info
+
+
+def detect_codec_type(rsv_path):
+    """Detect codec from RSV file. Returns 'h264' or 'hevc'."""
+    with open(rsv_path, 'rb') as f:
+        header = f.read(5)
+    if len(header) >= 5 and header[4] == 0x09:
+        return 'hevc'
+    return 'h264'
+
+
+def construct_hevc_params(f, meta_start, samples_to_scan=8):
+    """Extract HEVC VPS/SPS/PPS from Sony kkad box across RTMD metadata samples.
+    
+    Sony embeds VPS, SPS, and multiple PPS across metadata samples in the chunk.
+    kkad TLV tags for HEVC:
+      - Tag 12 04: VPS NAL unit (nal_type=32)
+      - Tag 02 04: SPS NAL unit (nal_type=33)
+      - Tag 03 04: PPS NAL unit (nal_type=34)
+    
+    Returns codec_info dict with vps, sps, pps_list, and parsed parameters.
+    """
+    vps = None
+    sps = None
+    pps_map = {}
+    
+    for s in range(samples_to_scan):
+        f.seek(meta_start + s * META_SAMPLE_SIZE)
+        meta_sample = f.read(META_SAMPLE_SIZE)
+        if len(meta_sample) < META_SAMPLE_SIZE:
+            break
+        
+        idx = meta_sample.find(b'kkad')
+        if idx < 4:
+            continue
+        box_size = struct.unpack('>I', meta_sample[idx-4:idx])[0]
+        if not (8 < box_size < 2000 and idx - 4 + box_size <= len(meta_sample)):
+            continue
+        kkad_data = meta_sample[idx+4:idx-4+box_size]
+        
+        for i in range(2, len(kkad_data) - 8):
+            tag1, tag2 = kkad_data[i], kkad_data[i+1]
+            nal_byte = kkad_data[i+2]
+            hevc_nal_type = (nal_byte >> 1) & 0x3f
+            
+            entry_len = struct.unpack('>H', kkad_data[i-2:i])[0]
+            if entry_len < 6 or entry_len > 500:
+                continue
+            
+            data_len = entry_len - 4  # entry_len includes 2-byte len + 2-byte tag
+            nal_start = i + 2
+            nal_end = nal_start + data_len
+            
+            if nal_end > len(kkad_data):
+                continue
+            
+            candidate = bytes(kkad_data[nal_start:nal_end])
+            
+            if tag1 == 0x12 and tag2 == 0x04 and hevc_nal_type == 32 and len(candidate) > 4:
+                vps = candidate
+            elif tag1 == 0x02 and tag2 == 0x04 and hevc_nal_type == 33 and len(candidate) > 4:
+                sps = candidate
+            elif tag1 == 0x03 and tag2 == 0x04 and hevc_nal_type == 34 and len(candidate) > 4:
+                r = BitReader(candidate[2:])
+                pid = r.read_ue()
+                pps_map[pid] = candidate
+    
+    if vps is None:
+        raise ValueError("Could not find VPS in kkad box")
+    if sps is None:
+        raise ValueError("Could not find SPS in kkad box")
+    if not pps_map:
+        raise ValueError("Could not find PPS in kkad box")
+    
+    pps_list = [pps_map[k] for k in sorted(pps_map.keys())]
+    
+    # Parse VPS using BitReader (handles emulation prevention automatically)
+    vps_reader = BitReader(vps[2:])
+    vps_reader.read_bits(4 + 1 + 1 + 6 + 3 + 1 + 16)  # vps header fields
+    general_profile_space = vps_reader.read_bits(2)
+    general_tier_flag = vps_reader.read_bits(1)
+    general_profile_idc = vps_reader.read_bits(5)
+    general_profile_compat = vps_reader.read_bits(32)
+    general_constraint = bytes([vps_reader.read_bits(8) for _ in range(6)])
+    general_level_idc = vps_reader.read_bits(8)
+    
+    # Parse SPS using BitReader
+    sps_reader = BitReader(sps[2:])
+    sps_reader.read_bits(4)  # sps_video_parameter_set_id
+    sps_max_sub_layers = sps_reader.read_bits(3)
+    sps_reader.read_bits(1)  # sps_temporal_id_nesting_flag
+    
+    # profile_tier_level(1, sps_max_sub_layers)
+    sps_reader.read_bits(96)
+    sub_layer_profile_present = []
+    sub_layer_level_present = []
+    for _ in range(sps_max_sub_layers):
+        sub_layer_profile_present.append(sps_reader.read_bit())
+        sub_layer_level_present.append(sps_reader.read_bit())
+    if sps_max_sub_layers > 0:
+        for _ in range(2 * (8 - sps_max_sub_layers)):
+            sps_reader.read_bit()
+    for i in range(sps_max_sub_layers):
+        if sub_layer_profile_present[i]:
+            sps_reader.read_bits(96)
+        if sub_layer_level_present[i]:
+            sps_reader.read_bits(8)
+            
+    sps_seq_parameter_set_id = sps_reader.read_ue()
+    chroma_format_idc = sps_reader.read_ue()
+    if chroma_format_idc == 3:
+        sps_reader.read_bit()
+    pic_width = sps_reader.read_ue()
+    pic_height = sps_reader.read_ue()
+    
+    conformance = sps_reader.read_bit()
+    if conformance:
+        sps_reader.read_ue()
+        sps_reader.read_ue()
+        sps_reader.read_ue()
+        sps_reader.read_ue()
+        
+    bit_depth_luma_minus8 = sps_reader.read_ue()
+    bit_depth_chroma_minus8 = sps_reader.read_ue()
+    
+    codec_info = {
+        'codec': 'hevc',
+        'vps_bytes': vps,
+        'sps_bytes': sps,
+        'pps_list': pps_list,
+        'width': pic_width,
+        'height': pic_height,
+        'profile_idc': general_profile_idc,
+        'level_idc': general_level_idc,
+        'general_tier_flag': general_tier_flag,
+        'general_profile_space': general_profile_space,
+        'general_profile_compat': general_profile_compat,
+        'general_constraint': general_constraint,
+        'chroma_format_idc': chroma_format_idc,
+        'bit_depth_luma': bit_depth_luma_minus8,
+        'bit_depth_chroma': bit_depth_chroma_minus8,
+        'time_scale': 48000,
+        'num_units_in_tick': 1001,
+    }
+    
+    return codec_info
+
+
+def build_hvcc(codec_info):
+    """Build hvcC box content from HEVC codec parameters."""
+    vps = codec_info['vps_bytes']
+    sps = codec_info['sps_bytes']
+    pps_list = codec_info['pps_list']
+    
+    hvcc = bytearray()
+    hvcc.append(1)  # configurationVersion
+    
+    byte1 = ((codec_info['general_profile_space'] & 3) << 6) | \
+             ((codec_info['general_tier_flag'] & 1) << 5) | \
+             (codec_info['profile_idc'] & 0x1f)
+    hvcc.append(byte1)
+    
+    hvcc.extend(struct.pack('>I', codec_info['general_profile_compat']))
+    hvcc.extend(codec_info['general_constraint'])  # 6 bytes
+    hvcc.append(codec_info['level_idc'])
+    
+    hvcc.extend(struct.pack('>H', 0xf000))  # min_spatial_segmentation_idc = 0, reserved
+    hvcc.append(0xfd)  # parallelismType = 1, reserved
+    hvcc.append(0xfc | (codec_info['chroma_format_idc'] & 3))
+    hvcc.append(0xf8 | (codec_info['bit_depth_luma'] & 7))
+    hvcc.append(0xf8 | (codec_info['bit_depth_chroma'] & 7))
+    hvcc.extend(struct.pack('>H', 0))  # avgFrameRate = 0
+    
+    # constantFrameRate(1) | numTemporalLayers(1) | temporalIdNested(0) | lengthSizeMinusOne(3)
+    hvcc.append(0x4b)
+    
+    # numOfArrays = 3 (VPS, SPS, PPS)
+    hvcc.append(3)
+    
+    # VPS array
+    hvcc.append(0xa0 | 32)
+    hvcc.extend(struct.pack('>H', 1))
+    hvcc.extend(struct.pack('>H', len(vps)))
+    hvcc.extend(vps)
+    
+    # SPS array
+    hvcc.append(0xa0 | 33)
+    hvcc.extend(struct.pack('>H', 1))
+    hvcc.extend(struct.pack('>H', len(sps)))
+    hvcc.extend(sps)
+    
+    # PPS array
+    hvcc.append(0xa0 | 34)
+    hvcc.extend(struct.pack('>H', len(pps_list)))
+    for pps in pps_list:
+        hvcc.extend(struct.pack('>H', len(pps)))
+        hvcc.extend(pps)
+    
+    return bytes(hvcc)
+
+
+def build_video_stsd_hevc(hvcc_data, width, height):
+    """Build video stsd box with hvc1 sample entry."""
+    hvc1 = b'\x00' * 6
+    hvc1 += struct.pack('>H', 1)  # dref_idx
+    hvc1 += b'\x00' * 16  # pre_defined, reserved, pre_defined
+    hvc1 += struct.pack('>HH', width, height)
+    hvc1 += struct.pack('>II', 0x00480000, 0x00480000)  # 72 dpi
+    hvc1 += b'\x00' * 4
+    hvc1 += struct.pack('>H', 1)  # frame_count
+    compressorname = b'\x0BHEVC Coding' + b'\x00' * 20
+    hvc1 += compressorname
+    hvc1 += struct.pack('>H', 0x0018)  # depth
+    hvc1 += struct.pack('>h', -1)  # pre_defined
+    hvc1 += make_box('hvcC', hvcc_data)
+    hvc1 += make_box('pasp', struct.pack('>II', 1, 1))
+    
+    stsd_data = struct.pack('>I', 1) + make_box('hvc1', hvc1)
+    return make_full_box('stsd', 0, 0, stsd_data)
+
+
+def build_audio_stsd_twos():
+    """Build audio stsd for PCM s16be using 'twos' codec tag (HEVC recordings)."""
+    twos = b'\x00' * 6
+    twos += struct.pack('>H', 1)  # dref_idx
+    twos += b'\x00' * 8  # reserved
+    twos += struct.pack('>HH', 2, 16)  # channel_count, sample_size
+    twos += struct.pack('>HH', 0, 0)  # compression_id, packet_size
+    twos += struct.pack('>I', 48000 << 16)  # sample_rate
+    
+    stsd_data = struct.pack('>I', 1) + make_box('twos', twos)
+    return make_full_box('stsd', 0, 0, stsd_data)
 
 
 class ExpGolombWriter:
@@ -1169,50 +1467,6 @@ def _build_pps_nal(pps_id=0):
     
     return nal_header + w.to_bytes()
 
-class BitReader:
-    def __init__(self, data):
-        # Remove emulation prevention bytes
-        clean_data = bytearray()
-        i = 0
-        while i < len(data):
-            if i + 2 < len(data) and data[i] == 0 and data[i+1] == 0 and data[i+2] == 3:
-                clean_data.extend(data[i:i+2])
-                i += 3
-            else:
-                clean_data.append(data[i])
-                i += 1
-        self.data = clean_data
-        self.byte_idx = 0
-        self.bit_idx = 0
-        
-    def read_bit(self):
-        if self.byte_idx >= len(self.data): return 0
-        val = (self.data[self.byte_idx] >> (7 - self.bit_idx)) & 1
-        self.bit_idx += 1
-        if self.bit_idx == 8:
-            self.byte_idx += 1
-            self.bit_idx = 0
-        return val
-
-    def read_bits(self, n):
-        val = 0
-        for _ in range(n):
-            val = (val << 1) | self.read_bit()
-        return val
-
-    def read_ue(self):
-        zeros = 0
-        while self.read_bit() == 0 and self.byte_idx < len(self.data):
-            zeros += 1
-        if self.byte_idx >= len(self.data): return 0
-        return (1 << zeros) - 1 + self.read_bits(zeros)
-        
-    def read_se(self):
-        v = self.read_ue()
-        if v % 2 == 0:
-            return -(v // 2)
-        else:
-            return (v + 1) // 2
 
 def parse_sps(sps_bytes):
     """Parse H.264 SPS NAL unit. Returns dict with codec info."""
@@ -1437,6 +1691,25 @@ def build_dinf_standalone():
     dref = make_full_box('dref', 0, 0, struct.pack('>I', 1) + url)
     return make_box('dinf', dref)
 
+def build_hevc_ctts(total_samples, delta):
+    """Build ctts box for HEVC using Sony's fixed IBBP pattern: (1, 3*delta), (2, 0)."""
+    offset_val = 3 * delta
+    entries = []
+    remaining = total_samples
+    while remaining > 0:
+        entries.append((1, offset_val))
+        remaining -= 1
+        if remaining <= 0:
+            break
+        take = min(2, remaining)
+        entries.append((take, 0))
+        remaining -= take
+        
+    data = struct.pack('>I', len(entries))
+    for count, off in entries:
+        data += struct.pack('>II', count, off)
+    return make_full_box('ctts', 0, 0, data)
+
 def build_moov_standalone(rsv_info, codec_info, mdat_offset):
     """Build complete moov box without a donor."""
     chunks = rsv_info['chunks']
@@ -1446,7 +1719,8 @@ def build_moov_standalone(rsv_info, codec_info, mdat_offset):
     for c in chunks:
         video_frame_sizes.extend(c['video_frame_sizes'])
     total_video_samples = len(video_frame_sizes)
-    total_meta_samples = num_chunks * 15
+    meta_spc = rsv_info.get('samples_per_chunk', 15)
+    total_meta_samples = num_chunks * meta_spc
     total_audio_samples = sum(c['audio_samples'] for c in chunks)
     
     video_timescale = codec_info['time_scale'] // 2
@@ -1491,12 +1765,20 @@ def build_moov_standalone(rsv_info, codec_info, mdat_offset):
             prev_spc = spc
             
     # Video
-    avcc = build_avcc(codec_info['sps_bytes'], codec_info['pps_list'], codec_info['profile_idc'], codec_info['level_idc'], codec_info['chroma_format_idc'], codec_info['bit_depth_luma'], codec_info['bit_depth_chroma'])
-    video_stsd = build_video_stsd_standalone(avcc, codec_info['width'], codec_info['height'])
+    # Video stsd — codec-aware
+    is_hevc = codec_info.get('codec') == 'hevc'
+    if is_hevc:
+        hvcc = build_hvcc(codec_info)
+        video_stsd = build_video_stsd_hevc(hvcc, codec_info['width'], codec_info['height'])
+    else:
+        avcc = build_avcc(codec_info['sps_bytes'], codec_info['pps_list'], codec_info['profile_idc'], codec_info['level_idc'], codec_info['chroma_format_idc'], codec_info['bit_depth_luma'], codec_info['bit_depth_chroma'])
+        video_stsd = build_video_stsd_standalone(avcc, codec_info['width'], codec_info['height'])
     
     video_stbl = b''
     video_stbl += video_stsd
     video_stbl += build_stts(total_video_samples, video_delta)
+    if is_hevc:
+        video_stbl += build_hevc_ctts(total_video_samples, video_delta)
     video_stbl += build_stsc_variable(video_stsc_entries)
     video_stbl += build_stsz_variable(video_frame_sizes)
     video_stbl += build_co64(video_offsets)
@@ -1509,9 +1791,9 @@ def build_moov_standalone(rsv_info, codec_info, mdat_offset):
     video_tkhd = build_tkhd_standalone(1, movie_duration, codec_info['width'], codec_info['height'])
     video_trak = video_tkhd + make_box('mdia', video_mdia)
     
-    # Audio
+    # Audio stsd — codec-aware
     audio_stbl = b''
-    audio_stbl += build_audio_stsd_standalone()
+    audio_stbl += build_audio_stsd_twos() if is_hevc else build_audio_stsd_standalone()
     audio_stbl += build_stts(total_audio_samples, 1)
     audio_stbl += build_stsc_variable(audio_stsc_entries)
     audio_stbl += build_stsz_uniform(4, total_audio_samples)
@@ -1528,7 +1810,7 @@ def build_moov_standalone(rsv_info, codec_info, mdat_offset):
     meta_stbl = b''
     meta_stbl += build_meta_stsd_standalone()
     meta_stbl += build_stts(total_meta_samples, meta_delta)
-    meta_stbl += build_stsc_variable([(1, 15, 1)])
+    meta_stbl += build_stsc_variable([(1, meta_spc, 1)])
     meta_stbl += build_stsz_uniform(META_SAMPLE_SIZE, total_meta_samples)
     meta_stbl += build_co64(meta_offsets)
     
@@ -1559,13 +1841,34 @@ def build_mp4_standalone(rsv_path, output_path, log_fn=None):
     rsv_info = parse_rsv(rsv_path, log_fn=log_fn)
     log_fn("")
     
-    log_fn("=== Detecting codec parameters ===")
+    # Detect codec type
+    codec_type = detect_codec_type(rsv_path)
+    log_fn(f"=== Detecting codec parameters ({codec_type.upper()}) ===")
+    
     with open(rsv_path, 'rb') as f:
-        sps, pps, codec_info = construct_sps_pps(
-            f,
-            video_start=rsv_info['chunks'][0]['video_offset'],
-            meta_start=rsv_info['chunks'][0]['meta_offset'],
-        )
+        if codec_type == 'hevc':
+            codec_info = construct_hevc_params(
+                f,
+                meta_start=rsv_info['chunks'][0]['meta_offset'],
+            )
+            # Determine frame rate from samples_per_chunk
+            spc = rsv_info.get('samples_per_chunk', 24)
+            if spc == 24:
+                codec_info['time_scale'] = 48000
+                codec_info['num_units_in_tick'] = 1001
+            elif spc == 15:
+                codec_info['time_scale'] = 60000
+                codec_info['num_units_in_tick'] = 1001
+            else:
+                codec_info['time_scale'] = 48000
+                codec_info['num_units_in_tick'] = 1001
+        else:
+            sps, pps, codec_info = construct_sps_pps(
+                f,
+                video_start=rsv_info['chunks'][0]['video_offset'],
+                meta_start=rsv_info['chunks'][0]['meta_offset'],
+            )
+            codec_info['codec'] = 'h264'
     
     log_fn(f"  Video: {codec_info['width']}x{codec_info['height']}, "
            f"Profile: {codec_info['profile_idc']} Level: {codec_info['level_idc']}")
@@ -1573,8 +1876,12 @@ def build_mp4_standalone(rsv_path, output_path, log_fn=None):
     log_fn(f"  FPS: {fps:.2f} ({codec_info['time_scale']}/(2*{codec_info['num_units_in_tick']}))")
     
     # Build ftyp
-    ftyp = struct.pack('>I4s4sI', 28, b'ftyp', b'XAVC', 0x01004F1F)
-    ftyp += b'XAVCmp42iso2'
+    if codec_type == 'hevc':
+        ftyp = struct.pack('>I4s4sI', 32, b'ftyp', b'XAVC', 0x010A1FFF)
+        ftyp += b'XAVCmp42iso2nras'
+    else:
+        ftyp = struct.pack('>I4s4sI', 28, b'ftyp', b'XAVC', 0x01004F1F)
+        ftyp += b'XAVCmp42iso2'
     
     rsv_size = rsv_info['rsv_size']
     ftyp_size = len(ftyp)
